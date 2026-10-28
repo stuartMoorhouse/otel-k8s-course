@@ -38,8 +38,8 @@ module "fck_nat" {
   version = "~> 1.6"
 
   name          = "${var.cluster_name}-fck-nat"
-  vpc_id        = module.vpc.vpc_id
-  subnet_id     = module.vpc.public_subnets[0]
+  vpc_id        = null_resource.vpc_guardduty_cleanup.triggers.vpc_id
+  subnet_id     = split(",", null_resource.vpc_guardduty_cleanup.triggers.public_subnet_ids)[0]
   instance_type = "t4g.nano"
   ha_mode       = true
 
@@ -47,20 +47,22 @@ module "fck_nat" {
   route_tables_ids    = { for i, id in module.vpc.private_route_table_ids : "private-${i}" => id }
 
   tags = var.tags
-
-  # Destroy order: EKS, fck-nat -> GuardDuty cleanup -> VPC.
-  depends_on = [null_resource.vpc_guardduty_cleanup]
 }
 
 # GuardDuty Runtime Monitoring creates VPC endpoints, ENIs and a security group inside the VPC
 # that Terraform does not track and that block VPC deletion (DependencyViolation).
 # Runs on destroy, after EKS and fck-nat are gone and before the VPC is removed:
 # endpoints -> ENIs -> security groups (retried, never swallowed).
+# That order comes from references, not depends_on (depends_on on a module defers all of its
+# data sources to apply time and breaks the EKS module's plan): fck-nat and EKS take their
+# VPC and subnet IDs from this resource's triggers, so they are created after it and destroyed before it.
 resource "null_resource" "vpc_guardduty_cleanup" {
   triggers = {
-    vpc_id  = module.vpc.vpc_id
-    region  = var.region
-    profile = var.aws_profile
+    vpc_id             = module.vpc.vpc_id
+    public_subnet_ids  = join(",", module.vpc.public_subnets)
+    private_subnet_ids = join(",", module.vpc.private_subnets)
+    region             = var.region
+    profile            = var.aws_profile
   }
 
   provisioner "local-exec" {
@@ -106,7 +108,11 @@ resource "null_resource" "vpc_guardduty_cleanup" {
     EOT
   }
 
-  depends_on = [module.vpc]
+}
+
+# Nodes need the NAT instance up to join the cluster; EKS subnet_ids below wait on this.
+resource "terraform_data" "nat_ready" {
+  input = module.fck_nat.autoscaling_group_arn
 }
 
 # --- EKS cluster + one managed node group (spot) ---
@@ -117,8 +123,11 @@ module "eks" {
   name               = var.cluster_name
   kubernetes_version = var.cluster_version
 
-  vpc_id     = module.vpc.vpc_id
-  subnet_ids = module.vpc.private_subnets
+  vpc_id = null_resource.vpc_guardduty_cleanup.triggers.vpc_id
+  subnet_ids = [
+    for s in split(",", null_resource.vpc_guardduty_cleanup.triggers.private_subnet_ids) :
+    s if terraform_data.nat_ready.id != ""
+  ]
 
   # Lets you run kubectl from your laptop; the creator (you) becomes cluster admin.
   endpoint_public_access                   = true
@@ -163,8 +172,4 @@ module "eks" {
       launch_template_tags = var.tags
     }
   }
-
-  # NAT route must exist (fck-nat) before nodes launch, and the GuardDuty cleanup
-  # must outlive EKS on destroy.
-  depends_on = [module.fck_nat, null_resource.vpc_guardduty_cleanup]
 }

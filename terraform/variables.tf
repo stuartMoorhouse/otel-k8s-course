@@ -58,3 +58,9 @@ variable "elastic_hot_size" {
   type        = string
   default     = "2g"
 }
+
+variable "elastic_region" {
+  description = "Elastic Cloud Hosted region ID. Older regions have no aws- prefix (eu-west-1), newer ones do (aws-eu-north-1). Keep it in the same area as the EKS region."
+  type        = string
+  default     = "eu-west-1"
+}
