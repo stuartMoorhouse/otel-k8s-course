@@ -1,0 +1,12 @@
+# Apply with:
+#   kubectl -n demo patch deployment redis --patch-file manifests/redis-discovery-patch.yaml
+# Adds annotations (hints) to the Redis POD TEMPLATE. The daemon collector's
+# receiver_creator reads them and starts a `redis` receiver for this pod.
+spec:
+  template:
+    metadata:
+      annotations:
+        io.opentelemetry.discovery.metrics/enabled: "true"
+        io.opentelemetry.discovery.metrics/scraper: redis
+        io.opentelemetry.discovery.metrics/config: |
+          collection_interval: "15s"

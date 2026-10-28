@@ -1,0 +1,8 @@
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Downloaded provider/module code is gitignored but still scanned by `--no-git`"
+paths = [
+  '''(^|/)\.terraform/''',
+]

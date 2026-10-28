@@ -1,0 +1,206 @@
+# Lab values for the opentelemetry-kube-stack Helm chart.
+# A deliberately SMALL version of Elastic's reference values.yaml (see lesson 07).
+#   - no OpAMP / Fleet management
+#   - no cluster collector, no hostmetrics/kubelet scraping
+#   - keeps the three things this course is about:
+#       1. daemon collector  (per-node: OTLP in + receiver_creator discovery)
+#       2. gateway collector (central: forwards to Elastic)
+#       3. Instrumentation   (zero-code auto-instrumentation)
+#
+# Versions below were the latest releases on 2026-10-28 (chart 0.25.1). Adjust if a key has moved.
+
+opentelemetry-operator:
+  admissionWebhooks:
+    certManager:
+      enabled: false # no cert-manager in the lab
+    autoGenerateCert:
+      enabled: true
+      recreate: true
+
+crds:
+  create: true
+
+defaultCRConfig:
+  image:
+    repository: "otel/opentelemetry-collector-contrib"
+    tag: "0.164.0"
+  targetAllocator:
+    enabled: false
+
+clusterRole:
+  rules:
+    # What k8s_observer + k8s_attributes need to read from the K8s API
+    - apiGroups: [""]
+      resources: ["pods", "namespaces", "nodes", "services", "endpoints"]
+      verbs: ["get", "list", "watch"]
+    - apiGroups: ["apps"]
+      resources: ["replicasets", "deployments", "daemonsets", "statefulsets"]
+      verbs: ["get", "list", "watch"]
+    - apiGroups: ["networking.k8s.io"]
+      resources: ["ingresses"]
+      verbs: ["get", "list", "watch"]
+
+collectors:
+  # ------------------------------------------------------------------
+  # DAEMON: one pod on every node
+  # ------------------------------------------------------------------
+  daemon:
+    fullnameOverride: "opentelemetry-kube-stack-daemon"
+    presets:
+      logsCollection:
+        enabled: false
+      kubernetesEvents:
+        enabled: false
+      clusterMetrics:
+        enabled: false
+    config:
+      extensions:
+        # Watches the K8s API and emits "endpoints" (pods, ports, services, nodes...)
+        k8s_observer:
+          # Only watch pods on THIS node, otherwise every daemon pod would
+          # scrape every Redis in the cluster (duplicates). Elastic's reference
+          # file doesn't set this; upstream docs recommend it for daemonsets.
+          node: ${env:OTEL_K8S_NODE_NAME}
+          observe_nodes: true
+          observe_services: true
+          observe_ingresses: true
+      receivers:
+        otlp:
+          protocols:
+            grpc:
+              endpoint: 0.0.0.0:4317
+            http:
+              endpoint: 0.0.0.0:4318
+        # Starts receivers on demand, driven by pod annotations (lesson 06)
+        receiver_creator/metrics:
+          watch_observers: [k8s_observer]
+          discovery:
+            enabled: true
+      processors:
+        batch: {}
+        k8s_attributes:
+          passthrough: false
+          filter:
+            node_from_env_var: OTEL_K8S_NODE_NAME
+          pod_association:
+            - sources:
+                - from: resource_attribute
+                  name: k8s.pod.ip
+            - sources:
+                - from: resource_attribute
+                  name: k8s.pod.uid
+            - sources:
+                - from: connection
+          extract:
+            metadata:
+              - k8s.namespace.name
+              - k8s.deployment.name
+              - k8s.pod.name
+              - k8s.pod.uid
+              - k8s.node.name
+              - service.name
+              - service.version
+      exporters:
+        debug:
+          verbosity: basic
+        otlp_grpc/gateway: # called `otlp` in older Collector versions
+          endpoint: "http://opentelemetry-kube-stack-gateway-collector:4317"
+          tls:
+            insecure: true
+      service:
+        extensions: [k8s_observer]
+        pipelines:
+          # null = switch off the chart's default pipelines
+          logs: null
+          metrics: null
+          traces: null
+          metrics/discovered:
+            receivers: [receiver_creator/metrics]
+            processors: [k8s_attributes, batch]
+            exporters: [debug, otlp_grpc/gateway]
+          metrics/apps:
+            receivers: [otlp]
+            processors: [k8s_attributes, batch]
+            exporters: [otlp_grpc/gateway]
+          logs/apps:
+            receivers: [otlp]
+            processors: [k8s_attributes, batch]
+            exporters: [otlp_grpc/gateway]
+          traces/apps:
+            receivers: [otlp]
+            processors: [k8s_attributes, batch]
+            exporters: [debug, otlp_grpc/gateway]
+
+  # ------------------------------------------------------------------
+  # GATEWAY: central deployment, sends to Elastic
+  # ------------------------------------------------------------------
+  gateway:
+    enabled: true
+    fullnameOverride: "opentelemetry-kube-stack-gateway"
+    suffix: gateway
+    replicas: 1
+    env:
+      - name: ELASTIC_OTLP_ENDPOINT
+        valueFrom:
+          secretKeyRef:
+            name: elastic-secret-otel
+            key: elastic_otlp_endpoint
+      - name: ELASTIC_API_KEY
+        valueFrom:
+          secretKeyRef:
+            name: elastic-secret-otel
+            key: elastic_api_key
+    config:
+      receivers:
+        otlp:
+          protocols:
+            grpc:
+              endpoint: ${env:OTEL_K8S_POD_IP}:4317
+            http:
+              endpoint: ${env:OTEL_K8S_POD_IP}:4318
+      exporters:
+        debug:
+          verbosity: basic
+        otlp_grpc/elastic:
+          endpoint: ${env:ELASTIC_OTLP_ENDPOINT}
+          headers:
+            Authorization: ApiKey ${env:ELASTIC_API_KEY}
+      service:
+        pipelines:
+          metrics:
+            receivers: [otlp]
+            exporters: [debug, otlp_grpc/elastic]
+          logs:
+            receivers: [otlp]
+            exporters: [debug, otlp_grpc/elastic]
+          traces:
+            receivers: [otlp]
+            exporters: [debug, otlp_grpc/elastic]
+
+  # Not needed in the lab
+  cluster:
+    enabled: false
+
+# ------------------------------------------------------------------
+# Auto-instrumentation: becomes an `Instrumentation` custom resource
+# ------------------------------------------------------------------
+instrumentation:
+  name: elastic-instrumentation
+  enabled: true
+  exporter:
+    # Where injected SDKs send data: the DAEMON collector (OTLP/HTTP)
+    endpoint: http://opentelemetry-kube-stack-daemon-collector.opentelemetry-operator-system.svc.cluster.local:4318
+  propagators:
+    - tracecontext
+    - baggage
+  sampler:
+    type: parentbased_traceidratio
+    argument: "1.0"
+  java:
+    image: docker.elastic.co/observability/elastic-otel-javaagent:1.14.0
+  nodejs:
+    image: docker.elastic.co/observability/elastic-otel-node:1.20.0
+  python:
+    image: docker.elastic.co/observability/elastic-otel-python:1.18.0
+  dotnet:
+    image: docker.elastic.co/observability/elastic-otel-dotnet:1.6.1
